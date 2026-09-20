@@ -192,6 +192,11 @@ echo "=== Stale DHCP_MASTER falls back to priority order ==="
 # A pin naming a departed node reads as "master is down" to is_serving, which
 # made every remaining node take over DHCP at once.
 eval "$(extract_fn "$HA_SRC" should_i_serve)"
+# should_i_serve gates every activation path on this node's own DNS health, the
+# same precondition should_i_hold_vip uses. Extract it too — an undefined helper
+# returns 127, which reads as "unhealthy" and fails these tests for its own
+# reason rather than the code's.
+eval "$(extract_fn "$HA_SRC" is_dns_healthy)"
 NODES=("10.33.47.55" "10.33.47.3")
 LOCAL_IP="10.33.47.3"; MY_IDX=1
 peer_ping["10.33.47.55"]="true"; peer_dns["10.33.47.55"]="true"
@@ -1163,9 +1168,254 @@ assert_contains "the bump is logged where it is persisted" \
     "$_after_manifest" "event=version_bump"
 
 # ============================================================
+echo
+echo "=== sync.conf is parsed, never sourced ==="
+
+# sync.conf travels inside the config-sync payload: pihole-ha-sync ships it and
+# pihole-ha-sync-pull writes it verbatim. It was then `.`-sourced in nine places
+# as root, so a peer that published a payload executed shell on every node.
+PLATFORM_SRC="$SCRIPT_DIR/../pihole-ha-platform"
+eval "$(extract_fn "$PLATFORM_SRC" is_valid_ip)"
+eval "$(extract_fn "$PLATFORM_SRC" load_sync_conf)"
+
+assert_eq "no script sources sync.conf any more" "" \
+    "$(grep -rln '\. "\$SYNC_CONF"' "$SCRIPT_DIR/.." --include='pihole-ha*' --include='*.sh' 2>/dev/null)"
+
+_sc="$(mktemp)"
+_PWNED=""
+cat > "$_sc" <<'CONF'
+SYNC_ENABLED=true
+_PWNED=$(id -u)
+SYNC_GRAVITY=false
+CONF
+SYNC_ENABLED=false SYNC_GRAVITY=true
+load_sync_conf "$_sc"
+assert_eq "a command substitution is not executed" "" "$_PWNED"
+assert_eq "whitelisted keys before it still load"  "true"  "$SYNC_ENABLED"
+assert_eq "whitelisted keys after it still load"   "false" "$SYNC_GRAVITY"
+
+# An unknown key must not become a variable at all — that is how HA_ENABLED or
+# SYNC_BLOB_DIR would be smuggled in from a peer's payload.
+printf 'HA_ENABLED=false\nSYNC_BLOB_DIR=/tmp/evil\n' > "$_sc"
+HA_ENABLED=true SYNC_BLOB_DIR=/var/lib/pihole-ha
+load_sync_conf "$_sc"
+assert_eq "an unlisted key is ignored"          "true" "$HA_ENABLED"
+assert_eq "the blob dir cannot arrive by sync"  "/var/lib/pihole-ha" "$SYNC_BLOB_DIR"
+
+# Values are shape-checked, and a rejected value leaves the caller's default.
+printf 'SYNC_PRIMARY=10.33.47.3\nSYNC_INTERVAL=30\n' > "$_sc"
+SYNC_PRIMARY="10.33.47.55" SYNC_INTERVAL=15
+load_sync_conf "$_sc"
+assert_eq "a valid primary is taken"   "10.33.47.3" "$SYNC_PRIMARY"
+assert_eq "a valid interval is taken"  "30"         "$SYNC_INTERVAL"
+
+printf 'SYNC_PRIMARY=10.33.47.3;id\nSYNC_INTERVAL=0\nSYNC_ENABLED=yes\n' > "$_sc"
+SYNC_PRIMARY="10.33.47.55" SYNC_INTERVAL=15 SYNC_ENABLED=true
+load_sync_conf "$_sc"
+assert_eq "a non-IP primary is refused"        "10.33.47.55" "$SYNC_PRIMARY"
+assert_eq "an out-of-range interval is refused" "15"         "$SYNC_INTERVAL"
+assert_eq "a non-boolean toggle is refused"     "true"       "$SYNC_ENABLED"
+
+# An absent key must leave the caller's default alone: every call site sets its
+# own defaults first and relies on that.
+: > "$_sc"
+SYNC_ENABLED=false
+load_sync_conf "$_sc"
+assert_eq "an absent key keeps the caller's default" "false" "$SYNC_ENABLED"
+
+printf 'SYNC_INTERVAL=45' > "$_sc"   # deliberately no trailing newline
+SYNC_INTERVAL=15
+load_sync_conf "$_sc"
+assert_eq "a final line without a newline is not dropped" "45" "$SYNC_INTERVAL"
+rm -f "$_sc"
+
+# ============================================================
+echo
+echo "=== An unreachable Pi-hole must not read as 'no password set' ==="
+
+# _check_auth collapsed "no password" and "could not ask" into one boolean, so a
+# slow or restarting FTL opened every mutating endpoint. sync-pull restarts FTL
+# on every config apply, so the window recurred on a timer.
+eval "$(extract_fn "$DASH_SRC" _check_auth)"
+_AUTH_FAIL_WHY="" _AUTH_CHECKED="" _AUTH_REQUIRED=""
+_validate_sid() { return 0; }
+
+_pihole_has_auth() { return 2; }   # cannot tell
+assert_false "a write is refused when Pi-hole cannot be reached" _check_auth "sid=whatever"
+assert_contains "the refusal says why" "$_AUTH_FAIL_WHY" "refusing the write"
+
+# "cannot tell" must not be cached — the next request has to ask again.
+_AUTH_CHECKED="" _AUTH_REQUIRED=""
+_check_auth "sid=x" >/dev/null 2>&1
+assert_eq "an unknown answer is not cached" "" "$_AUTH_CHECKED"
+
+_AUTH_CHECKED="" _AUTH_REQUIRED=""
+_pihole_has_auth() { return 1; }   # genuinely no password set
+assert_true "a genuinely passwordless node still allows writes" _check_auth ""
+
+_AUTH_CHECKED="" _AUTH_REQUIRED=""
+_pihole_has_auth() { return 0; }   # password set
+assert_true "a password-protected node still validates the sid" _check_auth "sid=good"
+
+# ============================================================
+echo
+echo "=== A node that cannot answer DNS never asserts DHCP ==="
+
+# should_i_hold_vip has always required local DNS health; should_i_serve did
+# not, so a primary whose FTL was up but not serving kept DHCP and the VIP while
+# a secondary took them too, and neither side ever yielded.
+NODES=("10.33.47.55" "10.33.47.3")
+peer_ping["10.33.47.55"]="true"; peer_dns["10.33.47.55"]="true"
+peer_api["10.33.47.55"]="true";  peer_dhcp["10.33.47.55"]="true"
+
+DHCP_MASTER="auto"; LOCAL_IP="10.33.47.55"; MY_IDX=0
+peer_dns["10.33.47.55"]="false"
+assert_false "index 0 stands down when its own DNS is dead" should_i_serve
+
+DHCP_MASTER="10.33.47.55"
+assert_false "a pinned master stands down when its own DNS is dead" should_i_serve
+
+peer_dns["10.33.47.55"]="true"
+DHCP_MASTER="auto"
+assert_true  "index 0 serves again once its DNS recovers" should_i_serve
+
+# The guard must not abort the daemon for a node missing from the peer maps.
+LOCAL_IP="10.33.47.99"; MY_IDX=0
+assert_true  "an unknown local ip does not abort under set -u" no_unbound_error should_i_serve
+assert_false "an unknown local ip does not serve"              should_i_serve
+
+# ============================================================
+echo
+echo "=== Cluster key helper ==="
+
+KEY_SRC="$SCRIPT_DIR/../pihole-ha-cluster-key"
+eval "$(extract_fn "$KEY_SRC" _peers)"
+
+_keyconf="$(mktemp -d)"
+NODES_CONF="$_keyconf/nodes.conf"
+printf 'HA_NODES=10.33.47.55,10.33.47.3:8081,10.33.47.5\n' > "$NODES_CONF"
+_local_ip() { echo "10.33.47.3"; }
+
+_peerlist="$(_peers | tr '\n' ' ')"
+assert_contains     "peers include the other nodes"   "$_peerlist" "10.33.47.55"
+assert_contains     "peers include the third node"    "$_peerlist" "10.33.47.5"
+assert_not_contains "peers exclude this node"         "$_peerlist" "10.33.47.3 "
+assert_not_contains "the web port is stripped for ssh" "$_peerlist" "8081"
+
+# A node not listed in HA_NODES must still see every peer, not silently none.
+_local_ip() { echo "10.33.47.99"; }
+assert_eq "an unlisted node still lists all peers" "3" "$(_peers | wc -l)"
+
+: > "$NODES_CONF"
+assert_eq "no nodes.conf entries yields no peers" "0" "$(_peers | wc -l)"
+rm -rf "$_keyconf"
+
+# The key must never reach argv — /proc/<pid>/cmdline is world-readable, which is
+# the same mistake install.sh makes with the Pi-hole password.
+_keysrc_body="$(cat "$KEY_SRC")"
+assert_not_contains "the key is not interpolated into an ssh command" \
+    "$_keysrc_body" 'ssh -o ConnectTimeout=10 "$dest" "umask 077; cat > ~/$REMOTE_TMP" "$(cat'
+assert_contains "the key is piped to ssh on stdin instead" \
+    "$_keysrc_body" 'cat > ~/$REMOTE_TMP" < "$KEY_FILE"'
+assert_contains "the key is created under a restrictive umask" \
+    "$_keysrc_body" 'umask 077; openssl rand -hex 32'
+
+# /etc/pihole-ha may legitimately be 0750 root:pihole so the DHCP hook can read
+# notify.conf. The remote step must not clamp it the way install.sh does.
+assert_contains     "the remote step creates the dir without re-moding it" "$_keysrc_body" "sudo mkdir -p '\$CONF_DIR'"
+# Comments are stripped: the script explains in prose why it avoids this, and
+# the prose must not be what satisfies the assertion.
+_keysrc_code="$(grep -vE '^[[:space:]]*#' "$KEY_SRC")"
+assert_not_contains "the remote step does not clamp the config dir"        "$_keysrc_code" "install -d -m 700"
+
+# It has to be installed, or `pihole-ha cluster-key` is a dead subcommand.
+_inst="$(cat "$SCRIPT_DIR/../install.sh")"
+assert_contains "the installer installs it"      "$_inst" "pihole-ha-debug pihole-ha-cluster-key"
+assert_contains "the uninstaller removes it"     "$_inst" "/usr/local/bin/pihole-ha-cluster-key"
+assert_contains "the docker image ships it"      "$(cat "$SCRIPT_DIR/../docker/Dockerfile")" "COPY pihole-ha-cluster-key"
+assert_contains "the CLI exposes it"             "$(cat "$SCRIPT_DIR/../pihole-ha-cli")" "cluster-key|key)"
+
+# ============================================================
+echo
+echo "=== Updates follow the repo that was installed ==="
+
+# pihole-ha-cli used to hardcode the upstream repo, so `pihole-ha update` on a
+# fork fetched upstream and overwrote the fork's own changes.
+eval "$(extract_fn "$SCRIPT_DIR/../pihole-ha-platform" platform_repo_info)"
+
+_rt="$(mktemp -d)"
+_mkrepo() {   # $1 = remote url, $2 = branch
+    rm -rf "$_rt/r"; git init -q "$_rt/r" 2>/dev/null
+    git -C "$_rt/r" config remote.origin.url "$1"
+    git -C "$_rt/r" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x 2>/dev/null
+    git -C "$_rt/r" branch -M "${2:-main}" 2>/dev/null
+}
+_field() { sed -n "s/^$1=//p" <<< "$2"; }
+
+if command -v git >/dev/null 2>&1; then
+    _mkrepo "git@github.com:Eriobis/pihole-ha-cluster.git" main
+    _info="$(platform_repo_info "$_rt/r")"
+    assert_eq "an ssh remote is rewritten to https" \
+        "https://github.com/Eriobis/pihole-ha-cluster.git" "$(_field REPO_URL "$_info")"
+    assert_eq "the fork's slug is recorded" "Eriobis/pihole-ha-cluster" "$(_field REPO_SLUG "$_info")"
+
+    _mkrepo "https://github.com/Eriobis/pihole-ha-cluster.git" feature-x
+    _info="$(platform_repo_info "$_rt/r")"
+    assert_eq "the installed branch is recorded, not assumed main" \
+        "feature-x" "$(_field REPO_BRANCH "$_info")"
+
+    _mkrepo "ssh://git@gitlab.com/team/ha.git" main
+    assert_eq "a non-github host still resolves" "gitlab.com" \
+        "$(_field REPO_HOST "$(platform_repo_info "$_rt/r")")"
+
+    # Anything we cannot turn into a fetch URL must yield nothing, so the caller
+    # keeps its upstream default rather than writing a broken repo.conf.
+    _mkrepo "/srv/local/bare.git" main
+    assert_eq "a local path yields nothing" "" "$(platform_repo_info "$_rt/r" 2>/dev/null)"
+    _mkrepo 'https://github.com/evil$(id)/repo.git' main
+    assert_eq "a remote with shell metacharacters is refused" "" "$(platform_repo_info "$_rt/r" 2>/dev/null)"
+else
+    echo "  SKIP  git not available"
+fi
+
+# The CLI must derive its fetch URLs from repo.conf, and degrade sanely.
+CLI_SRC="$SCRIPT_DIR/../pihole-ha-cli"
+_cliurls() {   # $1 = repo.conf path -> "TARBALL|RAW|SLUG|BRANCH"
+    PIHOLE_HA_REPO_CONF="$1" bash -c '
+        PIHOLE_HA_REPO_CONF="'"$1"'"
+        source "'"$CLI_SRC"'" help >/dev/null 2>&1
+        printf "%s|%s|%s|%s" "$REPO_TARBALL" "$RAW_VERSION_URL" "$REPO_SLUG" "$REPO_BRANCH"' 2>/dev/null
+}
+
+printf 'REPO_URL=https://github.com/Eriobis/pihole-ha-cluster.git\nREPO_HOST=github.com\nREPO_SLUG=Eriobis/pihole-ha-cluster\nREPO_BRANCH=feature-x\n' > "$_rt/gh.conf"
+_u="$(_cliurls "$_rt/gh.conf")"
+assert_contains "the tarball points at the fork"        "$_u" "github.com/Eriobis/pihole-ha-cluster/archive"
+assert_contains "the tarball uses the installed branch" "$_u" "feature-x.tar.gz"
+assert_contains "the version check follows the fork"    "$_u" "raw.githubusercontent.com/Eriobis/pihole-ha-cluster/feature-x/VERSION"
+assert_not_contains "upstream is not consulted"         "$_u" "RamSet"
+
+printf 'REPO_URL=https://gitlab.com/team/ha.git\nREPO_HOST=gitlab.com\nREPO_SLUG=team/ha\nREPO_BRANCH=main\n' > "$_rt/gl.conf"
+_u="$(_cliurls "$_rt/gl.conf")"
+assert_contains "a non-github host still gets a tarball url" "$_u" "gitlab.com/team/ha/archive"
+assert_contains "the github-only version check is disabled"  "$_u" "|main"
+assert_not_contains "no raw.githubusercontent url is invented" "$_u" "raw.githubusercontent"
+
+_u="$(_cliurls "$_rt/absent.conf")"
+assert_contains "without repo.conf it falls back to upstream" "$_u" "RamSet/pihole-ha-cluster"
+rm -rf "$_rt"
+
+# All three writers/readers have to agree, or the fork is followed only by half
+# the tooling.
+_inst="$(cat "$SCRIPT_DIR/../install.sh")"
+assert_contains "the installer records it on a fresh install" "$_inst" '_write_repo_conf "$SCRIPT_DIR"'
+assert_contains "the installer records it on update"          "$_inst" '_write_repo_conf "$_src"'
+assert_contains "setup.sh exports the detected repo"          "$(cat "$SCRIPT_DIR/../setup.sh")" "PIHOLE_HA_REPO_SLUG"
+assert_contains "the dashboard update check follows it too"   "$(cat "$SCRIPT_DIR/../pihole-ha-dash")" "REPO_SLUG=//p"
+
+# ============================================================
 
 all_ok=true
-for script in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull install.sh; do
+for script in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull install.sh pihole-ha-cluster-key pihole-ha-cli; do
     fpath="$SCRIPT_DIR/../$script"
     if [[ -f "$fpath" ]]; then
         if bash -n "$fpath" 2>&1; then

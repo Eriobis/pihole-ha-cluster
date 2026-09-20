@@ -125,6 +125,33 @@ is_valid_ip() {
     local i; for i in 1 2 3 4; do (( ${BASH_REMATCH[$i]} > 255 )) && return 1; done; return 0
 }
 
+# Record the repo this install came from, so `pihole-ha update` follows the fork
+# it was installed from instead of the upstream URL compiled into pihole-ha-cli.
+# setup.sh exports these; when install.sh is run directly (which is what
+# `pihole-ha update` does) we re-detect from the checkout we are running out of.
+# Writing nothing is fine — the CLI falls back to upstream.
+_write_repo_conf() {   # $1 = source checkout
+    local _src="$1" _info=""
+    if [[ -z "${PIHOLE_HA_REPO_SLUG:-}" && -f "$_src/pihole-ha-platform" ]]; then
+        _info="$( . "$_src/pihole-ha-platform" >/dev/null 2>&1; platform_repo_info "$_src" )" || _info=""
+        PIHOLE_HA_REPO_URL="$(sed -n 's/^REPO_URL=//p'       <<< "$_info")"
+        PIHOLE_HA_REPO_HOST="$(sed -n 's/^REPO_HOST=//p'     <<< "$_info")"
+        PIHOLE_HA_REPO_SLUG="$(sed -n 's/^REPO_SLUG=//p'     <<< "$_info")"
+        PIHOLE_HA_REPO_BRANCH="$(sed -n 's/^REPO_BRANCH=//p' <<< "$_info")"
+    fi
+    [[ -n "${PIHOLE_HA_REPO_SLUG:-}" ]] || return 0
+    mkdir -p /usr/local/share/pihole-ha
+    cat > /usr/local/share/pihole-ha/repo.conf <<RCONF
+# Written by the installer. This is the repo 'pihole-ha update' follows.
+# Delete this file to fall back to the upstream project.
+REPO_URL=${PIHOLE_HA_REPO_URL}
+REPO_HOST=${PIHOLE_HA_REPO_HOST}
+REPO_SLUG=${PIHOLE_HA_REPO_SLUG}
+REPO_BRANCH=${PIHOLE_HA_REPO_BRANCH}
+RCONF
+    chmod 644 /usr/local/share/pihole-ha/repo.conf
+}
+
 printf "\\n"
 _bw=37
 _brule="$(printf '═%.0s' $(seq 1 $((_bw + 2))))"
@@ -205,7 +232,8 @@ if [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]]; then
     rm -f /usr/local/bin/pihole-ha /usr/local/bin/pihole-ha-dash /usr/local/bin/pihole-ha-sync \
            /usr/local/bin/pihole-ha-monitor \
           /usr/local/bin/pihole-ha-sync-pull /usr/local/bin/pihole-ha-inject /usr/local/bin/pihole-ha-debug \
-          /usr/local/bin/new_dhcp_device /usr/local/bin/pihole-ha-oui-update
+          /usr/local/bin/new_dhcp_device /usr/local/bin/pihole-ha-oui-update \
+          /usr/local/bin/pihole-ha-cluster-key
     rm -f /etc/systemd/system/pihole-ha*.service /etc/systemd/system/pihole-ha*.timer /etc/systemd/system/pihole-ha*.path
     rm -rf /var/lib/pihole-ha
     systemctl daemon-reload 2>/dev/null || true
@@ -314,7 +342,7 @@ if [[ "${1:-}" == "--update" ]]; then
         exit 1
     fi
     # scripts
-    for _s in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull pihole-ha-inject pihole-ha-debug; do
+    for _s in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull pihole-ha-inject pihole-ha-debug pihole-ha-cluster-key; do
         [[ -f "$_src/$_s" ]] && { cp "$_src/$_s" "/usr/local/bin/$_s"; chmod 755 "/usr/local/bin/$_s"; }
     done
     [[ -f "$_src/new-dhcp-device" ]] && { cp "$_src/new-dhcp-device" /usr/local/bin/new_dhcp_device; chmod 755 /usr/local/bin/new_dhcp_device; }
@@ -329,6 +357,7 @@ if [[ "${1:-}" == "--update" ]]; then
     # web UI source (admin panel; www/ only exists in the internal build)
     mkdir -p /usr/local/share/pihole-ha
     for _w in ha.lp ha-api.lp ha.js VERSION; do [[ -f "$_src/$_w" ]] && cp "$_src/$_w" "/usr/local/share/pihole-ha/$_w"; done
+    _write_repo_conf "$_src"
     if [[ -d "$_src/www" ]]; then
         mkdir -p /usr/local/share/pihole-ha/www
         cp "$_src/www/"* /usr/local/share/pihole-ha/www/ 2>/dev/null || true
@@ -803,7 +832,7 @@ chmod 755 /usr/local/lib/pihole-ha/pihole-ha-cli
 printf "%b  %b Platform abstraction installed\\n" "${OVER}" "${TICK}"
 
 printf "  %b Installing scripts..." "${INFO}"
-for script in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull pihole-ha-inject pihole-ha-debug; do
+for script in pihole-ha pihole-ha-dash pihole-ha-sync pihole-ha-sync-pull pihole-ha-inject pihole-ha-debug pihole-ha-cluster-key; do
     cp "$SCRIPT_DIR/$script" /usr/local/bin/$script
     chmod 755 /usr/local/bin/$script
 done
@@ -819,6 +848,7 @@ cp "$SCRIPT_DIR/ha.lp" /usr/local/share/pihole-ha/ha.lp
 cp "$SCRIPT_DIR/ha-api.lp" /usr/local/share/pihole-ha/ha-api.lp
 cp "$SCRIPT_DIR/ha.js" /usr/local/share/pihole-ha/ha.js
 [[ -f "$SCRIPT_DIR/VERSION" ]] && cp "$SCRIPT_DIR/VERSION" /usr/local/share/pihole-ha/VERSION
+_write_repo_conf "$SCRIPT_DIR"
 printf "%b  %b Web UI files installed\\n" "${OVER}" "${TICK}"
 
 printf "  %b Installing systemd services..." "${INFO}"

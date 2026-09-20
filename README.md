@@ -86,6 +86,18 @@ sudo ./setup.sh
 
 `setup.sh` auto-detects whether Pi-hole is running as a Docker container or bare metal and runs the appropriate installer. If both are found, it asks which to use. You can also run `install.sh` (bare metal) or `docker-install.sh` (Docker) directly.
 
+> **The repo you install from is the repo you keep updating from.** `setup.sh` records the
+> clone's `origin` remote and branch, and from then on `pihole-ha update` — and the "update
+> available" badge in the web UI — follow **that** repo, not this one. So if you install from
+> your own fork, updates come from your fork and will not silently overwrite your changes with
+> upstream. Install from a branch and it keeps following that branch.
+>
+> An `ssh://` or `git@` remote is recorded as its `https://` equivalent, because `pihole-ha
+> update` clones as root and root has no reason to hold your deploy key — so the fork must be
+> readable without credentials for unattended updates to work. It is recorded in
+> `/usr/local/share/pihole-ha/repo.conf`; delete that file to fall back to upstream. Check which
+> repo a node is following with `pihole-ha version`.
+
 ### What the Installer Does
 
 1. **Scans the subnet** in parallel for existing pihole-ha nodes on port 8887
@@ -104,16 +116,17 @@ For manual Docker setup without the installer, see [Docker README](docker/README
 After install, a global `pihole-ha` command is available from any directory (no need to be in the clone):
 
 ```bash
-pihole-ha update       # update this node to the latest release (fetches fresh from GitHub)
+pihole-ha update       # update this node (fetches fresh from the repo it was installed from)
 pihole-ha status       # version, service state, and this node's role / VIP / DHCP
-pihole-ha version      # installed version + whether an update is available
+pihole-ha version      # installed version, the repo being followed, and whether an update exists
 pihole-ha restart      # restart the daemon and dashboard
 pihole-ha logs [-f]    # daemon + dashboard logs (add -f to follow)
 pihole-ha debug        # run the diagnostics collector
+pihole-ha cluster-key  # create the config-sync signing key and copy it to the other nodes
 pihole-ha uninstall    # remove pihole-ha (Pi-hole is left untouched)
 ```
 
-`update` pulls a fresh copy of the latest release and runs the installer, so it works no matter where (or whether) the original clone still exists. Commands that change the system re-run with `sudo` automatically. The classic `cd <clone> && sudo ./install.sh --update` still works too — and is how an existing install first picks up the `pihole-ha` command.
+`update` pulls a fresh copy from **the repo and branch this node was installed from** (see the note under [Installation](#installation)) and runs the installer, so it works no matter where (or whether) the original clone still exists. `pihole-ha version` prints which repo that is. Commands that change the system re-run with `sudo` automatically. The classic `cd <clone> && sudo ./install.sh --update` still works too — and is how an existing install first picks up the `pihole-ha` command.
 
 ### Configuration Files
 
@@ -276,6 +289,21 @@ pihole-ha is designed for a **trusted LAN**. Two controls harden it beyond that 
 **Signed config sync (recommended).** Standbys apply whatever config the sync payload contains (DNS records, FTL settings, gravity DB), so a rogue peer or a MITM on the plain-HTTP transfer could otherwise push malicious config. To prevent that, put the **same secret** in `/etc/pihole-ha/cluster.key` on **every** node:
 
 ```bash
+# On the sync primary: create the key and copy it to the other nodes over ssh.
+sudo pihole-ha cluster-key
+```
+
+`pihole-ha cluster-key` generates the secret (mode `600`, never world-readable even
+briefly), prints it, lists the peers from `nodes.conf`, and offers to copy it to each
+one over ssh — the key travels on stdin, never as a command-line argument, so it does
+not appear in `ps` or `/proc` on either end. It then compares fingerprints to confirm
+each peer really holds the same key. Run it on the **sync primary first** (see below);
+it tells you if you are on the wrong node. `--show` reprints the existing key,
+`--force` replaces it.
+
+Doing it by hand instead:
+
+```bash
 # generate once, then copy the SAME file to every node (chmod 600):
 sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/pihole-ha/cluster.key'
 sudo systemctl restart pihole-ha-sync.timer pihole-ha-sync-pull.timer   # or just wait for the next cycle
@@ -311,6 +339,7 @@ The HA page is injected into Pi-hole's sidebar under **Tools > HA Cluster**. A s
 | `pihole-ha-sync-pull` | Pull sync payload (standbys only; checks every 15 min, pulls only on change) |
 | `pihole-ha-inject` | Inject HA page into Pi-hole web UI (bare metal) |
 | `pihole-ha-debug` | Diagnostics collector — `sudo pihole-ha-debug` prints a redacted support bundle |
+| `pihole-ha-cluster-key` | Creates `/etc/pihole-ha/cluster.key` and copies it to the peers over ssh — see [Security](#security) |
 | `pihole-ha-platform` | Platform abstraction layer (`/usr/local/lib/pihole-ha/`) — detects systemd vs Docker, provides unified functions for FTL restart, sync timer management, etc. |
 
 ### Pi-hole Admin Integration (`/usr/local/share/pihole-ha/`)
